@@ -50,16 +50,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
+import typing
 
 
 ############ HYPERPARAMS #########
 CRITIC_LR = 0.01
 ACTOR_LR = 0.0001
 
-GAMMA = 0.99
+GAMMA = 0.95
 CLIP = 0.2
 TIMESTEPS = 110
-MINIBATCH_SIZE = 16
+MINIBATCH_SIZE = 12
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Transition = namedtuple('Transition', 
@@ -70,23 +71,22 @@ class ActorCritic(nn.Module):
     # We create a different class for our ACTOR-CRITICS so we can save old_policies. 
     def __init__(self, input_dims, output_dims):
         super(ActorCritic, self).__init__()
-
+  
         self.actor = nn.Sequential(
-            nn.Linear(input_dims, 124),
+            nn.Linear(input_dims, 215),
             nn.ReLU(),
-            nn.Linear(124, 64),
+            nn.Linear(215, 215),
             nn.ReLU(),
-            nn.Linear(64, output_dims),
-            nn.ReLU()
+            nn.Linear(215, output_dims),
+            nn.Softmax()
         )
 
         self.critic = nn.Sequential(
-            nn.Linear(input_dims, 124),
+            nn.Linear(input_dims, 214),
             nn.ReLU(),
-            nn.Linear(124, 64),
+            nn.Linear(214, 94),
             nn.ReLU(),
-            nn.Linear(64, output_dims),
-            nn.ReLU()
+            nn.Linear(94, 1)
         )
 
     def forward(self, state):
@@ -100,8 +100,7 @@ class ActorCritic(nn.Module):
         # We can return the actual action distribution, the log-action distribution, and the critic
         # distribution.
         # probs = self.actor(state)
-        action_distribution = Categorical(self.actor(state))
-        print(action_distribution)
+        action_distribution = Categorical(self.actor(state.flatten()))
         
         # Samples action from the action distribution.
         action = action_distribution.sample()
@@ -111,14 +110,16 @@ class ActorCritic(nn.Module):
         act_dist_entropy = action_distribution.entropy()
 
         # Critic evalutation of the network. 
-        critic_state_distribution = self.critic(state)
+
+        critic_state_distribution = self.critic(state.flatten())
 
         # critic_state_distribution /= critic_state_distribution.sum()
 
         # NOTE TO SELF
         # Experiement with log_action_dist vs action_distribution
 
-        return action, log_action_dist, critic_state_distribution, act_dist_entropy
+        # print("what is this: ", action)
+        return action.item(), log_action_dist, critic_state_distribution, act_dist_entropy, action_distribution
 
 
 
@@ -134,11 +135,10 @@ class PPO(nn.Module):
         self.batch_states = []
         self.policy_action_distributions = []
         self.old_policy_action_distributions = []
-        self.critic_distributions = []
+        self.value_functions = []                           # critic distributions 
         self.batch_actions = []
         # obtained after 
         self.batch_rewards = []
-        self.batch_new_states = []
         self.terminal_state = []
 
         self.optimizer = torch.optim.Adam([
@@ -159,127 +159,117 @@ class PPO(nn.Module):
         v2: learning rate will consist of clipping loss plus an entropy bonus. 
 
         '''
+        print("TERMINAL STATE? ", self.terminal_state)
+        print("LENGTH OF TERM STATE: ", len(self.terminal_state))
         # Skip training if batch_size not reached. 
-        if len(self.batch_states) < MINIBATCH_SIZE:
-            pass
-
-        # we have a bunch of lists that we need to convert to tensors.
-
-        print("rewards", self.batch_rewards)
-        batch_states = torch.tensor(np.array(self.batch_states), dtype=torch.float32)
-        policy_action_distributions = tuple(self.policy_action_distributions)
-        old_policy_action_distributions = tuple(self.old_policy_action_distributions)
-        critic_distributions = torch.cat(self.critic_distributions, dim=0)
-        batch_actions = torch.tensor(self.batch_actions)
-        batch_rewards = torch.tensor(self.batch_rewards)
-        batch_new_states = torch.tensor(self.batch_new_states)
-        terminal_state = torch.tensor(self.terminal_state)
-
-        print(f"batch_states = {batch_states}")
-        print(f"policy_act_dist = {policy_action_distributions}")
-        #print(f"batch_states = {batch_states}")
-        #print(f"batch_states = {batch_states}")
-        #print(f"batch_states = {batch_states}")
-        #print(f"batch_states = {batch_states}")
-
-        states = torch.squeeze(batch_states.unsqueeze(0).detach().to(device))
-        policy_act_dist = torch.squeeze(torch.stack(policy_action_distributions, dim=0)).detach().to(device)
-        old_policy_act_dist = torch.squeeze(torch.stack(old_policy_action_distributions, dim=0)).detach().to(device)
-        #critic_dist = torch.squeeze(torch.stack(critic_distributions, dim=0)).detach().to(device)
-        #batch_acts = torch.squeeze(torch.stack(batch_actions, dim=0)).detach().to(device)
-        rewards = torch.squeeze(torch.stack(batch_rewards, dim=0)).detach().to(device)
-        new_states = torch.squeeze(torch.stack(batch_new_states, dim=0)).detach().to(device)
-        term_states = torch.squeeze(torch.stack(terminal_state, dim=0)).detach().to(device)
+        if len(self.batch_rewards) < MINIBATCH_SIZE:
+            return
         
-        # Compute advantage
-        advantage = self.compute_advantage_function(states, rewards, new_states)
+        # set old policy to current policy, before learning
+        temp_storage = self.policy.state_dict().copy()
+
+        # get advantage function
+        advantage = self.compute_advantage_function(self.value_functions, self.batch_rewards)
+
+        # calculate r_t
+        prob_ratio = torch.Tensor(np.divide(np.array(self.policy_action_distributions), np.array(self.old_policy_action_distributions)))
 
         # Compute probability ratio tensor. 
-        prob_ratio = policy_act_dist/old_policy_act_dist
         prob_ratio = self.clip_ratio(prob_ratio)
 
         # compute the clipped_loss
-        clipped_loss = prob_ratio*advantage
+        clipped_loss = torch.multiply(prob_ratio, advantage)
 
         # compute expected value of clipped loss
         loss = torch.mean(clipped_loss)
+        loss = loss.requires_grad_(True)
 
-        # self.optimizer.zero_grad()
+        self.optimizer.zero_grad()
         loss.backward()
+
         self.optimizer.step()
+        # self.old_policy.load_state_dict(temp_storage)
 
         # clear all our memory
         self.batch_states = []
         self.policy_action_distributions = []
         self.old_policy_action_distributions = []
-        self.critic_distributions = []
+        self.value_functions = []
         self.batch_actions = []
         self.batch_rewards = []
-        self.batch_new_states = []
         self.terminal_state = []
         
-    def make_action(self, state):
+    def make_action(self, state: typing.Dict):
         ''' This is different from the actor-critic networks action as we need to store the values we 
             obtain from this'''
+        
+        input_state = observation_to_values(state)
+
         with torch.no_grad():
             # Run network to get nessessary variables, while ensuring pytorch does not compute gradients.
-            state = torch.FloatTensor(state).to(device)
-            action, log_action_distribution, critic_distribution, entropy = self.policy.forward(state)
-            old_action, log_old_actor_distribution, old_critic_distribution, old_entropy = self.old_policy.forward(state)
+            input_state = torch.Tensor(input_state).to(device)
+            action, log_action_distribution, critic_distribution, entropy, cur_act_dist = self.policy.forward(input_state)
+            old_action, log_old_actor_distribution, old_critic_distribution, old_entropy, old_act_dist = self.old_policy.forward(input_state)
 
         # Store the nessessary variables.
-        print(np.array(log_action_distribution))
-        self.batch_states.append(np.array(state))
+
+        print("CURRENT ACTION DIST: ", cur_act_dist.probs, "OLD_ACT_DIST: ", old_act_dist.probs)
+
+        self.batch_states.append(input_state)
         self.policy_action_distributions.append(log_action_distribution)
         self.old_policy_action_distributions.append(log_old_actor_distribution)
-        self.critic_distributions.append(critic_distribution)
+        self.value_functions.append(critic_distribution)
         self.batch_actions.append(action)
-
+        self.terminal_state.append(0)
 
         return action
 
     def clip_ratio(self, prob_ratio):
-        clipped_ratio = torch.clamp(prob_ratio, 1 - CLIP, 1 + CLIP)
+        clipped_ratio = torch.clamp(torch.Tensor(prob_ratio), 1 - CLIP, 1 + CLIP)
         return torch.min(prob_ratio, clipped_ratio)
 
-    def compute_advantage_function(self, states, rewards, new_states):
+    def compute_advantage_function(self, states, rewards):
         '''
         params:
-            states: the tensor of self.batch_states
+            states: an array of self.value_functions
             reward: the tensor of self.batch_rewards
             new_states: the tensor of self.batch_new_states
 
         This is the calculation of the advantage function.
 
-        We can derive the advantage function in the paper to be equivilant to:
-        A_t = sum_{t=0}^T(y^t r_t) + sum_{t=0}^(T-1)(y^{t+1}V_(t+1) - y^tV_t) 
+        We can derive the advantage function in the paper to be equivilant to
 
         Using this, we can do the following:
         '''
+
+
         # best_action, _ = torch.max(self.critic_distributions, dim=0)
-        indices = torch.arange(16).reshape(-1, 1)
-        weights = torch.pow(GAMMA, indices)
+        length_of_rewards = len(rewards)
+        indices = np.arange(length_of_rewards).reshape(-1, 1)
+        weights = np.power(GAMMA, indices)
+        print(weights)
+        print("rewards" , rewards)
 
         # we now calculated our weighted states and rewards. 
-        weighted_rewards = rewards * weights
-        weighted_states = states * weights
-        weighted_new_states = new_states * weights
+        weighted_rewards = rewards * weights.transpose()
+        print(weighted_rewards)
 
-        # calculate advantage tensor
-        advantage = torch.sum(weighted_rewards) + torch.sum(weighted_states - weighted_new_states, dim=1, keepdim=True)
+        last_state = states[-1] * weights[-1]
+
+        print("sum of weighted rewards ", np.sum(weighted_rewards))
+        print(states[0].item())
+        print(last_state.item())
+
+        # calculate advantage
+        advantage = np.sum(weighted_rewards) - states[0].item() + last_state.item()
 
         return advantage
-
-    def next_state_append(self, reward, new_state, term_state):
-        self.batch_rewards.append(reward)
-        self.batch_new_states.append(new_state)
-        self.terminal_state.append(term_state)
         
     def save(self, chkpt):
         torch.save(self.policy_old.state_dict(), chkpt)
 
     def load(self, chkpt):
-        self.policy_old.load_state_dict(torch.load(chkpt, map_location=lambda storage, loc: storage))
+        self.old_policy.load_state_dict(torch.load(chkpt, map_location=lambda storage, loc: storage))
         self.policy.load_state_dict(torch.load(chkpt, map_location=lambda storage, loc: storage))
 
 # BATCH_SIZE is the number of transitions sampled from the replay buffer
@@ -295,6 +285,52 @@ EPS_START = 0.9
 EPS_END = 0.001 #in long games each action is really important, so we want to be greedy after lots of training
 EPS_DECAY = 1000
 
+def observation_to_values(observation):
+    # Nathan's modified observation helper function
+    #init
+    board = observation['board']
+    #print(board)
+    health = 100
+    n_channels = 5
+    state_matrix = np.zeros((n_channels, board["height"], board["width"]))
+    #fill
+    for _snake in board['snakes']:
+        if _snake['id'] == '92addb3f-1e17-483f-90bc-e3a386b7a92a':
+            body_length = _snake['length']
+        health = np.array(_snake['health'])
+        #place head on channel 0
+        state_matrix[0, _snake['head']['x'], _snake['head']['y']] = 1
+        #place tail on channel 1
+        state_matrix[1, _snake['body'][-1]['x'], _snake['body'][-1]['y']] = 1
+        #place body on channel 2
+        for _body_segment in _snake['body']:
+            state_matrix[2, _body_segment['x'], _body_segment['y']] = 1
+        
+    # Calculate variables nessessary for reward.
+    num_snakes = np.count_nonzero(state_matrix[0])
+    #body_length = np.count_nonzero(state_matrix[2])
+    print("body length: ", body_length)
+
+
+    #place food on channel 3
+    for _food in board["food"]:
+        state_matrix[3,_food['x'], _food['y']] = 1
+    #create health channel
+    state_matrix[4] = np.full((board["height"], board["width"]), health)
+    #flatten
+    # state_matrix = state_matrix.reshape(-1,1) # don't flatten if using conv layer
+
+    state_matrix = state_matrix.flatten()
+    #print()
+    print(state_matrix.shape)
+    state_matrix = np.append(state_matrix, [num_snakes, body_length])
+    print(state_matrix.shape)
+
+    #state_matrix.insert(health, num_snakes, body_length)
+    
+    return state_matrix
+
+# testing
 if __name__ == '__main__':
     agent = PPO(365, 4)
     random_1 = torch.rand(365)

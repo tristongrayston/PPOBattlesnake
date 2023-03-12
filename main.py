@@ -14,6 +14,7 @@ import random
 import typing
 from PPO import PPO
 import numpy as np
+import torch
 
 # Create a "current run" which calculates how long the snake is, and how many people are on the board. 
 cur_playthrough = []
@@ -26,7 +27,7 @@ def info() -> typing.Dict:
 
     return {
         "apiversion": "1",
-        "author": "",  # TODO: Your Battlesnake Username
+        "author": "I AM THE AUTHOR",  # TODO: Your Battlesnake Username
         "color": "#888888",  # TODO: Choose color
         "head": "default",  # TODO: Choose head
         "tail": "default",  # TODO: Choose tail
@@ -41,78 +42,21 @@ def start(game_state: typing.Dict):
 
 # end is called when your Battlesnake finishes a game
 def end(game_state: typing.Dict):
-    _, body, observation_vector = observation_to_values(game_state)
-    if body == 0:
-        reward = -100
-    else:
-        reward = 100
-        
-    agent.next_state_append(reward, observation_vector, 1)
+    print(game_state)
+    agent.batch_rewards[-1] -= 5
     print("GAME OVER\n")
-
-def observation_to_values(observation):
-    # Nathan's modified observation helper function
-    #init
-    board = observation['board']
-    health = 100
-    n_channels = 5
-    state_matrix = np.zeros((n_channels, board["height"], board["width"]))
-    #fill
-    for _snake in board['snakes']:
-        health = np.array(_snake['health'])
-        #place head on channel 0
-        state_matrix[0, _snake['head']['x'], _snake['head']['y']] = 1
-        #place tail on channel 1
-        state_matrix[1, _snake['body'][-1]['x'], _snake['body'][-1]['y']] = 1
-        #place body on channel 2
-        for _body_segment in _snake['body']:
-            state_matrix[2, _body_segment['x'], _body_segment['y']] = 1
-        
-        # Calculate variables nessessary for reward.
-        num_snakes = np.count_nonzero(state_matrix[0])
-        body_length = np.count_nonzero(state_matrix[2])
-
-    #place food on channel 3
-    for _food in board["food"]:
-        state_matrix[3,_food['x'], _food['y']] = 1
-    #create health channel
-    state_matrix[4] = np.full((board["height"], board["width"]), health)
-    #flatten
-    # state_matrix = state_matrix.reshape(-1,1) # don't flatten if using conv layer
-
-    state_matrix = np.concatenate([state_matrix, health.reshape(1,1)], axis=0)
-    
-    return num_snakes, body_length, state_matrix # .flatten() #dont flatten if using conv2d layers
 
 
 # move is called on every turn and returns your next move
 # Valid moves are "up", "down", "left", or "right"
 # See https://docs.battlesnake.com/api/example-move for available data
-reward = 1
 def move(game_state: typing.Dict) -> typing.Dict:  
     '''
     This is like the step-function in any gym env. The main game loop should theoretically take place in here.
     '''
-    num_snakes, body_length, observation_vector = observation_to_values(game_state)
 
-    # Check if we store into next_states or not 
-    if len(cur_playthrough) != 0:
-        # cur reward
-        # Turn our observation state into something
-        prev_move = cur_playthrough[-1]
-        if prev_move[0] < num_snakes:
-            reward += 20
-        if prev_move[1] < body_length:
-            reward += 15
-        cur_playthrough.append((num_snakes, body_length))
-        agent.next_state_append(reward, observation_vector, 0)
-
-    reward = 1
     # Default code which prevents the snake from going back into itself. 
-    # 0 = left
-    # 1 = right
-    # 2 = down
-    # 3 = up
+    move_dict = {0: "left", 1: "right", 2: "down", 3: "up"}
     is_move_safe = {0: True, 1: True, 2: True, 3: True}
 
     my_head = game_state["you"]["body"][0]  # Coordinates of your head
@@ -131,14 +75,26 @@ def move(game_state: typing.Dict) -> typing.Dict:
         is_move_safe[3] = False
 
     # we now get our action. 
-    action = agent.make_action(observation_vector)
+    action = agent.make_action(game_state)
     
     # We calculate our rewards in the normal game loop. 
     # We note that we actually have a safeguard for choosing actions that make the snake kill itself. 
     # We can hardcode those rewards without having the snake actually kill itself. 
 
+    if len(agent.batch_states) < 2:
+        reward = 0
+    else:
+        # the following keeps in mind that: 
+        # state_vector[-1] = cur_body_length
+        # state_vector[-2] = num_snakes_on_board
+        prev_state = agent.batch_states[-2]
+        prev_state_params = (prev_state[-2].item(), prev_state[-1].item())
+        cur_state = agent.batch_states[-1]
+        cur_state_params = (cur_state[-2].item(), cur_state[-1].item())
+        reward = 0.25 + 2*(cur_state_params[1] - prev_state_params[1]) + 1*(cur_state_params[0] - prev_state_params[0])
+
     if is_move_safe[action] == False:
-        reward -= 100
+        reward -= 5
         # If the move we return is wrong, we'll have it output a random safe move. 
         # Are there any safe moves left?
         safe_moves = []
@@ -154,13 +110,16 @@ def move(game_state: typing.Dict) -> typing.Dict:
         next_move = random.choice(safe_moves)
     next_move = action
 
+    agent.batch_rewards.append(reward)
+    agent.learn()
+
     print(f"MOVE {game_state['turn']}: {next_move}")
-    return {"move": next_move}
+    return {"move": move_dict[next_move]}
 
 
 # Start server when `python main.py` is run
 if __name__ == "__main__":
     from server import run_server
-    agent = PPO(512, 4)
+    agent = PPO(607, 4)
 
     run_server({"info": info, "start": start, "move": move, "end": end})

@@ -22,7 +22,9 @@ def run_server(handlers: typing.Dict):
     @app.post("/move")
     def on_move():
         game_state = request.get_json()
-        return handlers["move"](game_state)
+        handlers_of_move = handlers["move"](game_state)
+        print(handlers_of_move)
+        return handlers_of_move
 
     @app.post("/end")
     def on_end():
